@@ -3,10 +3,7 @@ name: Apartment Agent
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/10 * * * *"
-
-permissions:
-  contents: write
+    - cron: "*/20 * * * *"  # כל 20 דקות
 
 jobs:
   run-agent:
@@ -14,6 +11,14 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: |
+            state-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,14 +37,8 @@ jobs:
         run: |
           python main.py
 
-      - name: Commit seen ids (avoid duplicates)
-        run: |
-          if git status --porcelain | grep -q "seen_ids.json"; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add seen_ids.json
-            git commit -m "Update seen ids"
-            git push
-          else
-            echo "No changes to seen_ids.json"
-          fi
+      - name: Save state cache
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
