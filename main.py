@@ -2,42 +2,37 @@ import os
 import json
 import re
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 BASE = "https://www.yad2.co.il"
-SEARCH_URL = "https://www.yad2.co.il/realestate/rent?area=1&city=5000&topArea=2"
+SEEN_FILE = "seen_ids.json"
 
-UA = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120 Safari/537.36",
+    "Accept-Language": "he-IL,he;q=0.9,en;q=0.8"
 }
 
-SEEN_PATH = ".cache/seen.json"
 
-
-def load_config():
-    with open("config.json", "r", encoding="utf-8") as f:
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def load_seen():
-    os.makedirs(".cache", exist_ok=True)
-    if not os.path.exists(SEEN_PATH):
-        return set()
-    with open(SEEN_PATH, "r", encoding="utf-8") as f:
-        return set(json.load(f))
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def save_seen(seen_set):
-    os.makedirs(".cache", exist_ok=True)
-    with open(SEEN_PATH, "w", encoding="utf-8") as f:
-        json.dump(sorted(list(seen_set)), f, ensure_ascii=False, indent=2)
-
-
-def tg_send(token: str, chat_id: str, text: str):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+def tg_send(bot_token: str, chat_id: str, text: str):
+    # שולחים Plain Text בלבד (ללא parse_mode) כדי למנוע תקלות פורמט
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -47,196 +42,131 @@ def tg_send(token: str, chat_id: str, text: str):
     r.raise_for_status()
 
 
-def fetch_html(url: str) -> str:
-    r = requests.get(url, headers=UA, timeout=30)
+def normalize_url(u: str) -> str:
+    # משאירים URL יציב בלי fragment
+    p = urlparse(u)
+    return p._replace(fragment="").geturl()
+
+
+def extract_item_id(url: str) -> str:
+    m = re.search(r"/realestate/item/(\d+)", url)
+    return m.group(1) if m else url
+
+
+def fetch(url: str) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return r.text
 
 
-def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
-
-def extract_number(text: str):
-    if not text:
-        return None
-    m = re.search(r"([\d,]+)", text)
-    if not m:
-        return None
-    return int(m.group(1).replace(",", ""))
-
-
-def extract_rooms(text: str):
-    if not text:
-        return None
-    m = re.search(r"(\d+(?:\.\d+)?)\s*חדר", text)
-    if not m:
-        return None
-    return float(m.group(1))
-
-
-def extract_floor(text: str):
-    if not text:
-        return None
-    if "קרקע" in text:
-        return 0
-    m = re.search(r"קומה\s*([0-9]+)", text)
-    if not m:
-        return None
-    return int(m.group(1))
-
-
-def collect_listing_links(search_html: str):
+def extract_listing_links(search_html: str, search_url: str) -> list[str]:
     """
-    אוספים רק לינקים למודעות מעמוד התוצאות.
-    בלי להסתמך על טקסט בעמוד (כי הוא לפעמים לא קיים/חלקי).
+    מוצאים את כל הלינקים של מודעות מתוך עמוד התוצאות.
     """
-    soup = BeautifulSoup(search_html, "html.parser")
-    anchors = soup.find_all("a", href=True)
+    soup = BeautifulSoup(search_html, "lxml")
+    links = set()
 
-    ids_to_link = {}
-    for a in anchors:
+    for a in soup.find_all("a", href=True):
         href = a["href"]
-        if not href.startswith("/realestate/item/"):
-            continue
-        m = re.search(r"/realestate/item/(\d+)", href)
-        if not m:
-            continue
-        item_id = m.group(1)
-        ids_to_link[item_id] = urljoin(BASE, href)
+        if "/realestate/item/" in href:
+            full = normalize_url(urljoin(BASE, href))
+            links.add(full)
 
-    return [{"id": k, "link": v} for k, v in ids_to_link.items()]
+    # fallback קטן אם Yad2 שינו משהו והלינקים יושבים בסקריפטים
+    if not links:
+        for m in re.findall(r'"/realestate/item/\d+[^"]*"', search_html):
+            href = m.strip('"')
+            full = normalize_url(urljoin(BASE, href))
+            links.add(full)
+
+    return sorted(links)
 
 
-def parse_details_from_item_page(item_html: str):
+def extract_title_from_item_page(item_html: str) -> str:
     """
-    מנסים להוציא פרטים מתוך עמוד המודעה עצמו.
-    גם אם לא מצליחים להוציא הכל – לא מפסלים.
+    לא חובה. אם נמצא כותרת – נצרף אותה להודעה.
+    אם לא – נשלח רק URL.
     """
-    soup = BeautifulSoup(item_html, "html.parser")
-    full_text = normalize(soup.get_text(" ", strip=True))
+    soup = BeautifulSoup(item_html, "lxml")
 
-    price = None
-    # הרבה פעמים מחיר מופיע עם ₪
-    m_price = re.search(r"([\d,]+)\s*₪", full_text)
-    if m_price:
-        price = int(m_price.group(1).replace(",", ""))
+    # נסיון 1: title של הדף
+    t = (soup.title.string if soup.title and soup.title.string else "").strip()
+    if t:
+        t = re.sub(r"\s+", " ", t)
+        return t[:120]
 
-    rooms = extract_rooms(full_text)
-    floor = extract_floor(full_text)
+    # נסיון 2: h1
+    h1 = soup.find("h1")
+    if h1:
+        txt = re.sub(r"\s+", " ", h1.get_text(" ", strip=True))
+        return txt[:120]
 
-    # שכונה: קשה לחלץ תמיד. ננסה בכמה דרכים:
-    neighborhood = None
-    # לפעמים יש "שכונה: ..."
-    m_n = re.search(r"שכונ[הת]\s*[:\-]\s*([^|,]+)", full_text)
-    if m_n:
-        neighborhood = normalize(m_n.group(1))
-
-    return {
-        "price": price,
-        "rooms": rooms,
-        "floor": floor,
-        "neighborhood_text": full_text,   # נשמור טקסט לחיפוש מילות שכונה
-    }
-
-
-def passes_filters(details, cfg, area_cfg):
-    # מחיר
-    if details["price"] is not None:
-        if details["price"] < cfg["price_min"] or details["price"] > cfg["price_max"]:
-            return False
-
-    # חדרים
-    if details["rooms"] is not None:
-        if details["rooms"] < cfg["rooms_min"] or details["rooms"] > cfg["rooms_max"]:
-            return False
-
-    # קומה
-    if details["floor"] is not None:
-        if details["floor"] < cfg["min_floor"]:
-            return False
-
-    # שכונה/אזור:
-    # אם לא מצליחים למצוא — לא נפסול (כדי לא לפספס).
-    # אבל אם כן יש טקסט, נבדוק מילות שכונה.
-    text = details.get("neighborhood_text") or ""
-    keys = area_cfg.get("neighborhood_keywords") or []
-    if keys:
-        if text and not any(k in text for k in keys):
-            # אם יש לנו טקסט ולא מצאנו שכונה – נחשב "לא מתאים"
-            return False
-
-    return True
+    return ""
 
 
 def main():
-    token = os.environ.get("BOT_TOKEN")
-    chat_id = os.environ.get("CHAT_ID")
-    debug = os.environ.get("DEBUG", "1") == "1"
+    bot_token = os.environ.get("BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("CHAT_ID", "").strip()
+    if not bot_token or not chat_id:
+        raise RuntimeError("Missing BOT_TOKEN or CHAT_ID (set in GitHub Secrets).")
 
-    if not token or not chat_id:
-        raise RuntimeError("Missing BOT_TOKEN or CHAT_ID env vars (set them in GitHub Secrets).")
+    cfg = load_json("config.json", {})
+    searches = cfg.get("searches", [])
+    max_new_per_run = int(cfg.get("max_new_per_run", 15))
 
-    cfg = load_config()
-    seen = load_seen()
+    seen = load_json(SEEN_FILE, {"ids": []})
+    seen_ids = set(seen.get("ids", []))
 
-    search_html = fetch_html(SEARCH_URL)
-    links = collect_listing_links(search_html)
+    total_sent = 0
+    debug = []
 
-    # נבדוק הרבה לינקים כדי להימנע מפספוסים
-    links = links[:80]
+    for s in searches:
+        name = s.get("name", "חיפוש")
+        url = s.get("url")
+        if not url:
+            continue
 
-    total_links = len(links)
-    new_links = [x for x in links if x["id"] not in seen]
+        html = fetch(url)
+        links = extract_listing_links(html, url)
 
-    debug_lines = []
-    debug_lines.append(f"Debug: נמצאו {total_links} מודעות בעמוד, מתוכן {len(new_links)} חדשות (לא נראו).")
+        debug.append(f"{name}: נמצאו {len(links)} מודעות בעמוד התוצאות")
 
-    results_by_area = []
+        # רק החדשים
+        new_links = []
+        for l in links:
+            item_id = extract_item_id(l)
+            if item_id not in seen_ids:
+                new_links.append((item_id, l))
 
-    for area in cfg["areas"]:
-        hits = []
-        checked = 0
+        debug.append(f"{name}: חדשות שלא נשלחו עדיין: {len(new_links)}")
 
-        for it in new_links:
-            checked += 1
-            try:
-                item_html = fetch_html(it["link"])
-                details = parse_details_from_item_page(item_html)
-            except Exception:
-                # אם מודעה נחסמת/נכשלת – פשוט נמשיך
-                continue
-
-            if passes_filters(details, cfg, area):
-                hits.append(it)
-
-            # לא להעמיס: מקס 35 בדיקות לכל אזור
-            if checked >= 35:
+        # שולחים עד max_new_per_run לכל הריצה (לא להציף)
+        for item_id, link in new_links:
+            if total_sent >= max_new_per_run:
                 break
 
-            time.sleep(0.5)
+            title = ""
+            try:
+                item_html = fetch(link)  # "נכנס לדירה"
+                title = extract_title_from_item_page(item_html)
+            except Exception:
+                # אם כניסה למודעה נכשלה, עדיין נשלח את הלינק
+                title = ""
 
-        if hits:
-            results_by_area.append((area["title"], hits[:10]))
+            msg = f"{name}\n{title + chr(10) if title else ''}{link}"
+            tg_send(bot_token, chat_id, msg)
 
-    if debug:
-        tg_send(token, chat_id, "\n".join(debug_lines))
-        time.sleep(1)
+            seen_ids.add(item_id)
+            total_sent += 1
+            time.sleep(0.6)
 
-    if not results_by_area:
-        tg_send(token, chat_id, "לא נמצאו דירות שעברו סינון בריצה הזו. אם זה לא הגיוני – נרחיב עוד יותר את הקריטריונים/נשנה מקור נתונים.")
-        return
+    # סיכום קצר (כדי שתדעי שזה עובד גם אם אין חדשים)
+    summary = f"✅ ריצה הסתיימה. נשלחו {total_sent} מודעות חדשות.\n" + "\n".join(debug)
+    tg_send(bot_token, chat_id, summary)
 
-    for title, hits in results_by_area:
-        lines = [title]
-        for it in hits:
-            lines.append(it["link"])
-            seen.add(it["id"])
-        tg_send(token, chat_id, "\n".join(lines))
-        time.sleep(1)
-
-    save_seen(seen)
+    save_json(SEEN_FILE, {"ids": sorted(seen_ids)})
 
 
 if __name__ == "__main__":
     main()
+
