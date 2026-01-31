@@ -2,137 +2,193 @@ import json
 import os
 import re
 import time
-from urllib.parse import urljoin
+from typing import Dict, List, Set, Tuple
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-YAD2_BASE = "https://www.yad2.co.il"
 
-STATE_DIR = "state"
-SEEN_FILE = os.path.join(STATE_DIR, "seen_ids.json")
+BASE = "https://www.yad2.co.il"
 
 
-def load_seen() -> set[str]:
-    os.makedirs(STATE_DIR, exist_ok=True)
-    if not os.path.exists(SEEN_FILE):
-        return set()
+def load_json(path: str, default):
+    if not os.path.exists(path):
+        return default
     try:
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return set(map(str, data.get("seen_ids", [])))
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return set()
+        return default
 
 
-def save_seen(seen: set[str]) -> None:
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump({"seen_ids": sorted(seen)}, f, ensure_ascii=False, indent=2)
+def save_json(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def telegram_send(bot_token: str, chat_id: str, text: str) -> None:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+def normalize_item_url(href: str) -> Tuple[str, str]:
+    """
+    Convert href -> (full_url, uid)
+    uid is the part after /realestate/item/ up to ? or end.
+    """
+    if not href:
+        return "", ""
+
+    # Make full URL
+    full = href.strip()
+    if full.startswith("//"):
+        full = "https:" + full
+    elif full.startswith("/"):
+        full = urljoin(BASE, full)
+    elif full.startswith("http://") or full.startswith("https://"):
+        pass
+    else:
+        # relative without leading slash
+        full = urljoin(BASE + "/", full)
+
+    # Keep only yad2 domain (safety)
+    try:
+        host = urlparse(full).netloc
+        if "yad2.co.il" not in host:
+            return "", ""
+    except Exception:
+        return "", ""
+
+    if "/realestate/item/" not in full:
+        return "", ""
+
+    uid = full.split("/realestate/item/", 1)[1]
+    uid = uid.split("?", 1)[0].strip().strip("/")
+
+    # uid in yad2 is alphanumeric like yxpmvxkt (not numeric!)
+    if not uid or len(uid) < 5:
+        return "", ""
+
+    # Normalize URL without tracking query params
+    full_clean = urljoin(BASE, f"/realestate/item/{uid}")
+    return full_clean, uid
+
+
+def extract_item_links(html: str) -> List[Tuple[str, str]]:
+    """
+    Returns list of (url, uid) from a Yad2 rent results HTML.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    found: List[Tuple[str, str]] = []
+    seen_uids: Set[str] = set()
+
+    # First: extract <a href="..."> links
+    for a in soup.find_all("a", href=True):
+        url, uid = normalize_item_url(a["href"])
+        if url and uid and uid not in seen_uids:
+            found.append((url, uid))
+            seen_uids.add(uid)
+
+    # Fallback: regex scan (in case links appear in scripts or data attributes)
+    if not found:
+        # Capture /realestate/item/<id>
+        matches = set(re.findall(r"/realestate/item/([a-zA-Z0-9_-]{5,})", html))
+        for uid in matches:
+            url = urljoin(BASE, f"/realestate/item/{uid}")
+            if uid not in seen_uids:
+                found.append((url, uid))
+                seen_uids.add(uid)
+
+    return found
+
+
+def fetch(url: str, timeout: int = 30) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Connection": "keep-alive",
+        "Referer": BASE + "/",
+    }
+
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.text
+
+
+def telegram_send(bot_token: str, chat_id: str, text: str, disable_preview: bool = False):
+    api = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": disable_preview,
     }
-    r = requests.post(url, json=payload, timeout=30)
-    r.raise_for_status()
-
-
-def fetch_listing_urls(search_url: str) -> list[str]:
-    """
-    הכי פשוט:
-    - נכנסות ל-URL של החיפוש שלך
-    - מוצאות לינקים של מודעות מה-HTML
-    - מחזירות רשימה של URL-ים ייחודיים
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
-        "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
-    }
-
-    r = requests.get(search_url, headers=headers, timeout=30)
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    urls = set()
-
-    # 1) כל הלינקים בעמוד
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-
-        # דילוג על עוגנים/ג'אווהסקריפט
-        if not href or href.startswith("#") or href.startswith("javascript:"):
-            continue
-
-        full = urljoin(YAD2_BASE, href)
-
-        # סינון גס: רק לינקים שנראים כמו מודעת נדל"ן
-        # (ביד2 המבנים משתנים, אז אנחנו מאפשרות כמה דפוסים)
-        if "yad2.co.il" not in full:
-            continue
-        if "/realestate/" not in full:
-            continue
-
-        # הרבה מודעות כוללות מספרים (ID) ב-URL
-        if re.search(r"\d{5,}", full):
-            urls.add(full)
-
-    return sorted(urls)
-
-
-def extract_id(url: str) -> str:
-    """
-    מנסה לחלץ ID יציב מה-URL כדי להימנע מכפילויות.
-    אם אין, משתמשת ב-URL עצמו.
-    """
-    m = re.search(r"(\d{5,})", url)
-    return m.group(1) if m else url
+    resp = requests.post(api, json=payload, timeout=30)
+    resp.raise_for_status()
 
 
 def main():
-    bot_token = os.environ.get("BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("CHAT_ID", "").strip()
+    # Secrets from GitHub Actions
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+    CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-    if not bot_token or not chat_id:
-        raise RuntimeError("Missing BOT_TOKEN or CHAT_ID in environment variables (GitHub Secrets).")
+    if not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError("Missing BOT_TOKEN or CHAT_ID environment variables.")
 
-    # ה-URL המדויק שלך:
-    search_url = "https://www.yad2.co.il/realestate/rent?minPrice=5500&maxPrice=7300&minRooms=1.5&maxRooms=3&minFloor=1&imageOnly=1&priceOnly=1&multiNeighborhood=1520%2C1483%2C197&zoom=12"
+    config = load_json("config.json", {})
+    sources: List[Dict] = config.get("sources", [])
 
-    seen = load_seen()
+    if not sources:
+        raise RuntimeError("config.json must include sources list.")
 
-    all_urls = fetch_listing_urls(search_url)
+    seen_state = load_json("seen_ids.json", {"seen": []})
+    seen: Set[str] = set(seen_state.get("seen", []))
 
-    new_urls = []
-    for u in all_urls:
-        uid = extract_id(u)
-        if uid not in seen:
-            new_urls.append(u)
-            seen.add(uid)
+    total_new = 0
+    debug_lines = []
 
-    save_seen(seen)
+    for src in sources:
+        name = src.get("name", "חיפוש")
+        url = src.get("url")
+        if not url:
+            continue
 
-    if not new_urls:
-        telegram_send(bot_token, chat_id, "✅ ריצה הסתיימה. לא נמצאו מודעות חדשות בחיפוש הזה.")
-        return
+        # polite delay between sources
+        time.sleep(1.2)
 
-    # שולחות עד 10 קישורים בהודעה אחת כדי לא להציף
-    chunks = [new_urls[i:i+10] for i in range(0, len(new_urls), 10)]
+        try:
+            html = fetch(url)
+            links = extract_item_links(html)
 
-    for idx, chunk in enumerate(chunks, start=1):
-        lines = [
-            "🏠 נמצאו מודעות חדשות (ת\"א – צפון ישן / לב העיר / רמת אביב):",
-            *chunk
-        ]
-        telegram_send(bot_token, chat_id, "\n".join(lines))
-        time.sleep(1)  # קטן כדי לא להיתקע על rate limit
+            debug_lines.append(f"{name}: נמצאו בעמוד {len(links)} מודעות (לפני סינון כפילויות).")
 
-    telegram_send(bot_token, chat_id, f"✅ נשלחו {len(new_urls)} מודעות חדשות.")
+            new_links = [(u, uid) for (u, uid) in links if uid not in seen]
+
+            if new_links:
+                # Send header per source
+                telegram_send(BOT_TOKEN, CHAT_ID, f"🏡 עדכונים – {name}\nנמצאו {len(new_links)} מודעות חדשות:")
+
+                # Send links
+                for (u, uid) in new_links:
+                    telegram_send(BOT_TOKEN, CHAT_ID, u, disable_preview=True)
+                    seen.add(uid)
+                    total_new += 1
+                    # small pause to avoid telegram rate limits
+                    time.sleep(0.4)
+            else:
+                telegram_send(BOT_TOKEN, CHAT_ID, f"✅ {name}: אין מודעות חדשות כרגע.", disable_preview=True)
+
+        except Exception as e:
+            # Send error but keep running for other sources
+            telegram_send(BOT_TOKEN, CHAT_ID, f"⚠️ {name}: שגיאה בסריקה:\n{type(e).__name__}: {e}", disable_preview=True)
+
+    # Save state back
+    save_json("seen_ids.json", {"seen": sorted(seen)})
+
+    # Optional debug summary (comment out if you don't want it)
+    summary = "📌 סיכום ריצה:\n" + "\n".join(debug_lines) + f"\nסה״כ חדשות שנשלחו: {total_new}"
+    telegram_send(BOT_TOKEN, CHAT_ID, summary, disable_preview=True)
 
 
 if __name__ == "__main__":
