@@ -1,0 +1,21 @@
+{
+  "price_min": 5500,
+  "price_max": 7300,
+  "rooms_min": 1.5,
+  "rooms_max": 3.0,
+  "min_floor": 1,
+  "areas": [
+    {
+      "title": "☕ לב העיר",
+      "neighborhood_keywords": ["לב העיר"]
+    },
+    {
+      "title": "🌿 הצפון הישן",
+      "neighborhood_keywords": ["הצפון הישן", "צפון ישן"]
+    },
+    {
+      "title": "🌳 רמת אביב",
+      "neighborhood_keywords": ["רמת אביב"]
+    }
+  ]
+}
