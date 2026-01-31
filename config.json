@@ -1,21 +1,9 @@
 {
-  "price_min": 5500,
-  "price_max": 7300,
-  "rooms_min": 1.5,
-  "rooms_max": 3.0,
-  "min_floor": 1,
-  "areas": [
+  "searches": [
     {
-      "title": "☕ לב העיר",
-      "neighborhood_keywords": ["לב העיר"]
-    },
-    {
-      "title": "🌿 הצפון הישן",
-      "neighborhood_keywords": ["הצפון הישן", "צפון ישן"]
-    },
-    {
-      "title": "🌳 רמת אביב",
-      "neighborhood_keywords": ["רמת אביב"]
+      "name": "תל אביב (1520,1483,197)",
+      "url": "https://www.yad2.co.il/realestate/rent?minPrice=5500&maxPrice=7300&minRooms=1.5&maxRooms=3&minFloor=1&imageOnly=1&priceOnly=1&renovated=1&multiNeighborhood=1520%2C1483%2C197"
     }
-  ]
+  ],
+  "max_new_per_run": 15
 }
