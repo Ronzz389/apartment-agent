@@ -2,7 +2,7 @@
   "searches": [
     {
       "name": "תל אביב (1520,1483,197)",
-      "url": "https://www.yad2.co.il/realestate/rent?minPrice=5500&maxPrice=7300&minRooms=1.5&maxRooms=3&minFloor=1&imageOnly=1&priceOnly=1&renovated=1&multiNeighborhood=1520%2C1483%2C197"
+      "url": "https://www.yad2.co.il/realestate/rent?minPrice=5500&maxPrice=7300&minRooms=1.5&maxRooms=3&minFloor=1&imageOnly=1&priceOnly=1&multiNeighborhood=1520%2C1483%2C197"
     }
   ],
   "max_new_per_run": 15
