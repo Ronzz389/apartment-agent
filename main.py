@@ -2,12 +2,11 @@ import os
 import re
 import html
 import requests
+import xml.etree.ElementTree as ET
+from urllib.parse import urlencode
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
-
-# יד2 RSS לת"א שכירות (כל תל אביב)
-RSS_URL = "https://www.yad2.co.il/realestate/rent?topArea=2&area=1&city=5000&rss=1"
 
 # פילטרים שלך
 MIN_PRICE = 5500
@@ -16,44 +15,18 @@ MIN_ROOMS = 1.5
 MAX_ROOMS = 3.0
 MIN_FLOOR = 1
 
-# הפרדה לכותרת שונה לפי אזור
-AREA_BUCKETS = {
-    "צפון ישן": [
-        "צפון ישן",
-        "באזל",
-        "נורדאו",
-        "בן גוריון",
-        "הירקון",
-        "הטיילת",
-        "ארלוזורוב",
-        "אוסישקין",
-        "עזה",
-        "פנקס",
-    ],
-    "לב העיר": [
-        "לב העיר",
-        "דיזנגוף",
-        "כיכר דיזנגוף",
-        "אבן גבירול",
-        "כיכר רבין",
-        "פרישמן",
-        "גורדון",
-        "בוגרשוב",
-        "שינקין",
-        "רוטשילד",
-        "שדרות חן",
-        "הבימה",
-    ],
-    "רמת אביב": [
-        "רמת אביב",
-        "רמת אביב החדשה",
-        "רמת אביב ג",
-        "רמת אביב הירוקה",
-        "אוניברסיטת תל אביב",
-    ],
-}
+# שכונות (IDs) — 3 פידים נפרדים, כותרת שונה לכל אזור
+# אם תרצי להוסיף גם "רמת אביב ג׳" וכו' — אפשר להוסיף כאן עוד FEED
+FEEDS = [
+    {"name": "🌿 צפון ישן", "neighborhood_id": 1483},
+    {"name": "☕ לב העיר", "neighborhood_id": 1520},
+    {"name": "🌳 רמת אביב", "neighborhood_id": 197},
+]
 
-# אם מודעה לא שייכת לשום אזור – לא נשלח בכלל
+# בסיס URL ליד2 שכירות ת"א
+BASE_URL = "https://www.yad2.co.il/realestate/rent"
+
+# פסילות
 EXCLUDE_KEYWORDS = ["מרתף", "מרתפים", "סמי מרתף"]
 
 # חשד מתווך – שולחים אבל מסמנים
@@ -71,7 +44,24 @@ BROKER_HINTS = [
 ]
 NO_BROKER_HINTS = ["ללא תיווך", "בלי תיווך", "פרטי", "מפרטי"]
 
+# מניעת כפילויות
 SEEN_FILE = "seen.txt"
+
+
+def build_rss_url(neighborhood_id: int) -> str:
+    # אנחנו "מלמדים" את יד2 לסנן מראש: ת"א + שכונה + מחיר + חדרים + rss=1
+    params = {
+        "topArea": 2,
+        "area": 1,
+        "city": 5000,
+        "neighborhood": neighborhood_id,
+        "minPrice": MIN_PRICE,
+        "maxPrice": MAX_PRICE,
+        "minRooms": MIN_ROOMS,
+        "maxRooms": MAX_ROOMS,
+        "rss": 1,
+    }
+    return f"{BASE_URL}?{urlencode(params)}"
 
 
 def send_telegram(text: str):
@@ -97,19 +87,28 @@ def save_seen(seen: set[str]):
             f.write(x + "\n")
 
 
-def strip_html(s: str) -> str:
+def clean_text(s: str) -> str:
     s = html.unescape(s or "")
-    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"<[^>]+>", " ", s)       # להסיר HTML אם מופיע
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def contains_excluded(text: str) -> bool:
+    t = text.lower()
+    return any(k.lower() in t for k in EXCLUDE_KEYWORDS)
+
+
+def broker_suspected(text: str) -> bool:
+    t = text.lower()
+    if any(x.lower() in t for x in NO_BROKER_HINTS):
+        return False
+    return any(x.lower() in t for x in BROKER_HINTS)
 
 
 def extract_price(text: str) -> int | None:
     # "מחיר 7,200" / "שכד: 6800"
     m = re.search(r"(?:מחיר|שכ\"?ד|שכד)\s*[:\-]?\s*([\d,]{4,})", text)
-    if not m:
-        # fallback – מספר 4+ ספרות ראשון
-        m = re.search(r"\b([\d,]{4,})\b", text)
     if not m:
         return None
     return int(m.group(1).replace(",", ""))
@@ -129,129 +128,105 @@ def extract_floor(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def contains_excluded(text: str) -> bool:
-    t = text.lower()
-    return any(k.lower() in t for k in EXCLUDE_KEYWORDS)
+def fetch_rss_items(rss_url: str) -> list[dict]:
+    r = requests.get(rss_url, timeout=30)
+    r.raise_for_status()
 
+    root = ET.fromstring(r.content)
 
-def broker_suspected(text: str) -> bool:
-    t = text.lower()
-    if any(x.lower() in t for x in NO_BROKER_HINTS):
-        return False
-    return any(x.lower() in t for x in BROKER_HINTS)
-
-
-def detect_area_bucket(text: str) -> str | None:
-    """
-    מחזיר "צפון ישן" / "לב העיר" / "רמת אביב" / "גבולי" / None
-    """
-    t = text.lower()
-    hits = []
-
-    for bucket, keys in AREA_BUCKETS.items():
-        if any(k.lower() in t for k in keys):
-            hits.append(bucket)
-
-    if len(hits) == 1:
-        return hits[0]
-    if len(hits) > 1:
-        return "גבולי"
-    return None
-
-
-def header_for_bucket(bucket: str) -> str:
-    if bucket == "צפון ישן":
-        return "🌿 צפון ישן"
-    if bucket == "לב העיר":
-        return "☕ לב העיר"
-    if bucket == "רמת אביב":
-        return "🌳 רמת אביב"
-    return "📍 גבולי (צפון/לב העיר/רמת אביב)"
+    # RSS סטנדרטי: channel/item
+    items = []
+    for item in root.findall("./channel/item"):
+        title = clean_text(item.findtext("title", default=""))
+        link = clean_text(item.findtext("link", default=""))
+        desc = clean_text(item.findtext("description", default=""))
+        if link:
+            items.append({"title": title, "link": link, "desc": desc})
+    return items
 
 
 def main():
     seen = load_seen()
+    sent = 0
 
-    resp = requests.get(RSS_URL, timeout=30)
-    resp.raise_for_status()
+    for feed in FEEDS:
+        feed_name = feed["name"]
+        rss_url = build_rss_url(feed["neighborhood_id"])
 
-    items = re.findall(r"<item>(.*?)</item>", resp.text, flags=re.S)
-
-    sent_count = 0
-
-    for raw_item in items:
-        link_m = re.search(r"<link>(.*?)</link>", raw_item)
-        title_m = re.search(r"<title>(.*?)</title>", raw_item, flags=re.S)
-        desc_m = re.search(r"<description>(.*?)</description>", raw_item, flags=re.S)
-
-        if not link_m:
+        try:
+            items = fetch_rss_items(rss_url)
+        except Exception as e:
+            send_telegram(f"⚠️ שגיאת משיכה בפיד {feed_name}\n{type(e).__name__}: {e}")
             continue
 
-        link = strip_html(link_m.group(1))
-        title = strip_html(title_m.group(1) if title_m else "")
-        desc = strip_html(desc_m.group(1) if desc_m else "")
+        for it in items:
+            link = it["link"]
+            if link in seen:
+                continue
 
-        if link in seen:
-            continue
+            title = it["title"]
+            desc = it["desc"]
+            full_text = f"{title} {desc}"
 
-        full_text = f"{title} {desc}"
+            # פסילות
+            if contains_excluded(full_text):
+                seen.add(link)
+                continue
 
-        # פסילה מרתף
-        if contains_excluded(full_text):
-            continue
+            # חילוצים (Double-check למרות שה-URL כבר מסנן)
+            price = extract_price(full_text)
+            rooms = extract_rooms(full_text)
+            floor = extract_floor(full_text)
 
-        # אזור
-        bucket = detect_area_bucket(full_text)
-        if bucket is None:
-            continue
+            if price is not None and not (MIN_PRICE <= price <= MAX_PRICE):
+                seen.add(link)
+                continue
+            if rooms is not None and not (MIN_ROOMS <= rooms <= MAX_ROOMS):
+                seen.add(link)
+                continue
 
-        # חילוצים
-        price = extract_price(full_text)
-        rooms = extract_rooms(full_text)
-        floor = extract_floor(full_text)
+            # קומה: נסנן רק אם הצלחנו לחלץ. אם לא מופיע ב-RSS, לא נפסול כדי לא לפספס.
+            if floor is not None and floor < MIN_FLOOR:
+                seen.add(link)
+                continue
 
-        # סינונים – אם הצלחנו לחלץ ערך, נסנן עליו
-        if price is not None and not (MIN_PRICE <= price <= MAX_PRICE):
-            continue
-        if rooms is not None and not (MIN_ROOMS <= rooms <= MAX_ROOMS):
-            continue
-        if floor is not None and floor < MIN_FLOOR:
-            continue
+            suspected = broker_suspected(full_text)
+            header = feed_name
+            if suspected:
+                header = f"⚠️ חשד מתווך | {header}"
 
-        # חשד מתווך – רק סימון
-        suspected = broker_suspected(full_text)
+            lines = [f"🏠 {header}", title if title else "(כותרת לא זמינה)"]
 
-        hdr = header_for_bucket(bucket)
-        if suspected:
-            hdr = f"⚠️ חשד מתווך | {hdr}"
+            details = []
+            if price is not None:
+                details.append(f"💰 {price:,} ₪")
+            if rooms is not None:
+                details.append(f"🛏 {rooms} חדרים")
+            if floor is not None:
+                details.append(f"🧱 קומה {floor}")
+            if details:
+                lines.append(" | ".join(details))
 
-        lines = [f"🏠 {hdr}", title if title else "(כותרת לא זמינה)"]
+            lines.append("")
+            lines.append(link)
 
-        details = []
-        if price is not None:
-            details.append(f"💰 {price:,} ₪")
-        if rooms is not None:
-            details.append(f"🛏 {rooms} חדרים")
-        if floor is not None:
-            details.append(f"🧱 קומה {floor}")
-        if details:
-            lines.append(" | ".join(details))
+            send_telegram("\n".join(lines))
 
-        lines.append("")
-        lines.append(link)
+            seen.add(link)
+            sent += 1
 
-        send_telegram("\n".join(lines))
+            # לא להציף
+            if sent >= 10:
+                break
 
-        seen.add(link)
-        sent_count += 1
-
-        # לא להציף
-        if sent_count >= 10:
+        if sent >= 10:
             break
 
     save_seen(seen)
 
-    if sent_count == 0:
+    # כברירת מחדל אני לא שולחת "אין חדשות" כל ריצה כדי לא להציק.
+    # אם את רוצה בכל זאת, אפשר להדליק עם SECRET בשם SEND_HEARTBEAT="1"
+    if sent == 0 and os.environ.get("SEND_HEARTBEAT", "") == "1":
         send_telegram("✅ Apartment Agent רץ – אין מודעות חדשות שמתאימות כרגע.")
 
 
