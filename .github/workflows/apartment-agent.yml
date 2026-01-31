@@ -16,6 +16,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          
+      - name: Restore seen cache
+        uses: actions/cache@v4
+        with:
+          path: seen.txt
+          key: seen-${{ github.run_id }}
+          restore-keys: |
+            seen-
 
       - name: Install dependencies
         run: |
