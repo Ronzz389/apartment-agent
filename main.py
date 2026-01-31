@@ -16,40 +16,71 @@ MIN_ROOMS = 1.5
 MAX_ROOMS = 3.0
 MIN_FLOOR = 1
 
-# כמו שסיכמנו: שם המשתנה
-AREA_KEYWORDS = [
-    "צפון ישן",
-    "לב העיר",
-    "באזל",
-    "נורדאו",
-    "דיזנגוף",
-    "בן גוריון",
-    "ארלוזורוב",
-    "אבן גבירול",
-    "כיכר רבין",
-    "כיכר דיזנגוף",
-    "פרישמן",
-    "גורדון",
-    "בוגרשוב",
-    "הירקון",
-    "הטיילת",
-    "שדרות חן",
-    "רוטשילד",
-    "שינקין",
-]
+# הפרדה לכותרת שונה לפי אזור
+AREA_BUCKETS = {
+    "צפון ישן": [
+        "צפון ישן",
+        "באזל",
+        "נורדאו",
+        "בן גוריון",
+        "הירקון",
+        "הטיילת",
+        "ארלוזורוב",
+        "אוסישקין",
+        "עזה",
+        "פנקס",
+    ],
+    "לב העיר": [
+        "לב העיר",
+        "דיזנגוף",
+        "כיכר דיזנגוף",
+        "אבן גבירול",
+        "כיכר רבין",
+        "פרישמן",
+        "גורדון",
+        "בוגרשוב",
+        "שינקין",
+        "רוטשילד",
+        "שדרות חן",
+        "הבימה",
+    ],
+    "רמת אביב": [
+        "רמת אביב",
+        "רמת אביב החדשה",
+        "רמת אביב ג",
+        "רמת אביב הירוקה",
+        "אוניברסיטת תל אביב",
+    ],
+}
 
-EXCLUDE_KEYWORDS = [
-    "מרתף",
-    "מרתפים",
-    "סמי מרתף",
+# אם מודעה לא שייכת לשום אזור – לא נשלח בכלל
+EXCLUDE_KEYWORDS = ["מרתף", "מרתפים", "סמי מרתף"]
+
+# חשד מתווך – שולחים אבל מסמנים
+BROKER_HINTS = [
+    "תיווך",
+    "מתווך",
+    "משרד תיווך",
+    "דמי תיווך",
+    "עמלת תיווך",
+    "בלעדיות",
+    "סוכנות",
+    "agent",
+    "broker",
+    "לתיאום ביקור",
 ]
+NO_BROKER_HINTS = ["ללא תיווך", "בלי תיווך", "פרטי", "מפרטי"]
 
 SEEN_FILE = "seen.txt"
 
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json={"chat_id": CHAT_ID, "text": text})
+    r = requests.post(
+        url,
+        json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True},
+        timeout=30,
+    )
     r.raise_for_status()
 
 
@@ -67,7 +98,6 @@ def save_seen(seen: set[str]):
 
 
 def strip_html(s: str) -> str:
-    # RSS description לפעמים מגיע עם HTML
     s = html.unescape(s or "")
     s = re.sub(r"<[^>]+>", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -75,10 +105,11 @@ def strip_html(s: str) -> str:
 
 
 def extract_price(text: str) -> int | None:
-    # מחפש "מחיר 7,200" או "7200"
+    # "מחיר 7,200" / "שכד: 6800"
     m = re.search(r"(?:מחיר|שכ\"?ד|שכד)\s*[:\-]?\s*([\d,]{4,})", text)
     if not m:
-        m = re.search(r"\b([\d,]{4,})\b", text)  # fallback
+        # fallback – מספר 4+ ספרות ראשון
+        m = re.search(r"\b([\d,]{4,})\b", text)
     if not m:
         return None
     return int(m.group(1).replace(",", ""))
@@ -91,22 +122,51 @@ def extract_rooms(text: str) -> float | None:
 
 
 def extract_floor(text: str) -> int | None:
-    # "קומה 2" / "קומה: 5"
-    # מתייחס גם ל"קרקע" = 0
+    # "קומה 2" / "קרקע" (=0)
     if re.search(r"\bקרקע\b", text):
         return 0
     m = re.search(r"קומה\s*[:\-]?\s*(\d+)", text)
     return int(m.group(1)) if m else None
 
 
-def contains_area_keyword(text: str) -> bool:
-    t = text.lower()
-    return any(k.lower() in t for k in AREA_KEYWORDS)
-
-
 def contains_excluded(text: str) -> bool:
     t = text.lower()
     return any(k.lower() in t for k in EXCLUDE_KEYWORDS)
+
+
+def broker_suspected(text: str) -> bool:
+    t = text.lower()
+    if any(x.lower() in t for x in NO_BROKER_HINTS):
+        return False
+    return any(x.lower() in t for x in BROKER_HINTS)
+
+
+def detect_area_bucket(text: str) -> str | None:
+    """
+    מחזיר "צפון ישן" / "לב העיר" / "רמת אביב" / "גבולי" / None
+    """
+    t = text.lower()
+    hits = []
+
+    for bucket, keys in AREA_BUCKETS.items():
+        if any(k.lower() in t for k in keys):
+            hits.append(bucket)
+
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        return "גבולי"
+    return None
+
+
+def header_for_bucket(bucket: str) -> str:
+    if bucket == "צפון ישן":
+        return "🌿 צפון ישן"
+    if bucket == "לב העיר":
+        return "☕ לב העיר"
+    if bucket == "רמת אביב":
+        return "🌳 רמת אביב"
+    return "📍 גבולי (צפון/לב העיר/רמת אביב)"
 
 
 def main():
@@ -115,8 +175,6 @@ def main():
     resp = requests.get(RSS_URL, timeout=30)
     resp.raise_for_status()
 
-    # parse RSS פשוט בלי ספריות חיצוניות
-    # עובד כי זה XML סטנדרטי
     items = re.findall(r"<item>(.*?)</item>", resp.text, flags=re.S)
 
     sent_count = 0
@@ -138,12 +196,13 @@ def main():
 
         full_text = f"{title} {desc}"
 
-        # אזור
-        if not contains_area_keyword(full_text):
+        # פסילה מרתף
+        if contains_excluded(full_text):
             continue
 
-        # פסילות
-        if contains_excluded(full_text):
+        # אזור
+        bucket = detect_area_bucket(full_text)
+        if bucket is None:
             continue
 
         # חילוצים
@@ -151,7 +210,7 @@ def main():
         rooms = extract_rooms(full_text)
         floor = extract_floor(full_text)
 
-        # סינונים (אם לא הצלחנו לחלץ ערך — לא נפסול עליו, כדי לא לפספס דירות טובות)
+        # סינונים – אם הצלחנו לחלץ ערך, נסנן עליו
         if price is not None and not (MIN_PRICE <= price <= MAX_PRICE):
             continue
         if rooms is not None and not (MIN_ROOMS <= rooms <= MAX_ROOMS):
@@ -159,11 +218,15 @@ def main():
         if floor is not None and floor < MIN_FLOOR:
             continue
 
-        # הודעה
-        msg_lines = [
-            "🏠 דירה חדשה שעומדת בפילטרים שלך!",
-            title if title else "(כותרת לא זמינה)",
-        ]
+        # חשד מתווך – רק סימון
+        suspected = broker_suspected(full_text)
+
+        hdr = header_for_bucket(bucket)
+        if suspected:
+            hdr = f"⚠️ חשד מתווך | {hdr}"
+
+        lines = [f"🏠 {hdr}", title if title else "(כותרת לא זמינה)"]
+
         details = []
         if price is not None:
             details.append(f"💰 {price:,} ₪")
@@ -172,24 +235,23 @@ def main():
         if floor is not None:
             details.append(f"🧱 קומה {floor}")
         if details:
-            msg_lines.append(" | ".join(details))
+            lines.append(" | ".join(details))
 
-        msg_lines.append("")
-        msg_lines.append(link)
+        lines.append("")
+        lines.append(link)
 
-        send_telegram("\n".join(msg_lines))
+        send_telegram("\n".join(lines))
 
         seen.add(link)
         sent_count += 1
 
-        # לא להציף: מקסימום 10 הודעות בריצה
+        # לא להציף
         if sent_count >= 10:
             break
 
     save_seen(seen)
 
     if sent_count == 0:
-        # שקט—לא חובה, אבל זה עוזר לדעת שהסוכן חי
         send_telegram("✅ Apartment Agent רץ – אין מודעות חדשות שמתאימות כרגע.")
 
 
