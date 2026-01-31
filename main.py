@@ -8,7 +8,6 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE = "https://www.yad2.co.il"
-# חיפוש רחב לת"א להשכרה (פשוט להתחיל מפה ולסנן בקוד)
 SEARCH_URL = "https://www.yad2.co.il/realestate/rent?area=1&city=5000&topArea=2"
 
 UA = {
@@ -38,7 +37,6 @@ def save_seen(seen_set):
 
 
 def tg_send(token: str, chat_id: str, text: str):
-    # שולחות Plain Text בלבד כדי להימנע מ-ParseError
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -80,9 +78,6 @@ def extract_rooms(text: str):
 def extract_floor(text: str):
     if not text:
         return None
-    # "קומה 3" / "קומה קרקע" / "קומה 1"
-    if "קומה" not in text:
-        return None
     if "קרקע" in text:
         return 0
     m = re.search(r"קומה\s*([0-9]+)", text)
@@ -91,91 +86,93 @@ def extract_floor(text: str):
     return int(m.group(1))
 
 
-def parse_listings(html: str):
+def collect_listing_links(search_html: str):
     """
-    יד2 דינמי, אבל הקישורים למודעות מופיעים ב-HTML כ<a href="/realestate/item/...">
-    ניקח כל מה שנראה כמו מודעה + נשלוף ממנו טקסט.
+    אוספים רק לינקים למודעות מעמוד התוצאות.
+    בלי להסתמך על טקסט בעמוד (כי הוא לפעמים לא קיים/חלקי).
     """
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(search_html, "html.parser")
     anchors = soup.find_all("a", href=True)
 
-    items = []
+    ids_to_link = {}
     for a in anchors:
         href = a["href"]
         if not href.startswith("/realestate/item/"):
             continue
-
-        link = urljoin(BASE, href)
-        text = normalize(a.get_text(" ", strip=True))
-
-        # לפעמים הטקסט על ה-a ריק, אז ננסה לקחת גם מההורה הקרוב
-        if len(text) < 10:
-            parent_text = normalize(a.parent.get_text(" ", strip=True)) if a.parent else ""
-            text = parent_text or text
-
-        # מזהה יציב: המספר בסוף /realestate/item/XXXXXXX
         m = re.search(r"/realestate/item/(\d+)", href)
-        item_id = m.group(1) if m else link
+        if not m:
+            continue
+        item_id = m.group(1)
+        ids_to_link[item_id] = urljoin(BASE, href)
 
-        items.append({
-            "id": item_id,
-            "link": link,
-            "text": text
-        })
-
-    # להסיר כפילויות לפי id
-    uniq = {}
-    for it in items:
-        uniq[it["id"]] = it
-    return list(uniq.values())
+    return [{"id": k, "link": v} for k, v in ids_to_link.items()]
 
 
-def matches_filters(item, cfg, area_cfg):
-    t = item["text"]
+def parse_details_from_item_page(item_html: str):
+    """
+    מנסים להוציא פרטים מתוך עמוד המודעה עצמו.
+    גם אם לא מצליחים להוציא הכל – לא מפסלים.
+    """
+    soup = BeautifulSoup(item_html, "html.parser")
+    full_text = normalize(soup.get_text(" ", strip=True))
 
-    # שכונה/אזור לפי מילות מפתח
-    if area_cfg["neighborhood_keywords"]:
-        if not any(k in t for k in area_cfg["neighborhood_keywords"]):
-            return False
+    price = None
+    # הרבה פעמים מחיר מופיע עם ₪
+    m_price = re.search(r"([\d,]+)\s*₪", full_text)
+    if m_price:
+        price = int(m_price.group(1).replace(",", ""))
 
-    price = extract_number(t)
-    rooms = extract_rooms(t)
-    floor = extract_floor(t)
+    rooms = extract_rooms(full_text)
+    floor = extract_floor(full_text)
 
-    # מחיר: אם אין מחיר בטקסט — לא נפסול (כדי לא לפספס), אבל נעדיף כאלה עם מחיר
-    if price is not None:
-        if price < cfg["price_min"] or price > cfg["price_max"]:
+    # שכונה: קשה לחלץ תמיד. ננסה בכמה דרכים:
+    neighborhood = None
+    # לפעמים יש "שכונה: ..."
+    m_n = re.search(r"שכונ[הת]\s*[:\-]\s*([^|,]+)", full_text)
+    if m_n:
+        neighborhood = normalize(m_n.group(1))
+
+    return {
+        "price": price,
+        "rooms": rooms,
+        "floor": floor,
+        "neighborhood_text": full_text,   # נשמור טקסט לחיפוש מילות שכונה
+    }
+
+
+def passes_filters(details, cfg, area_cfg):
+    # מחיר
+    if details["price"] is not None:
+        if details["price"] < cfg["price_min"] or details["price"] > cfg["price_max"]:
             return False
 
     # חדרים
-    if rooms is not None:
-        if rooms < cfg["rooms_min"] or rooms > cfg["rooms_max"]:
+    if details["rooms"] is not None:
+        if details["rooms"] < cfg["rooms_min"] or details["rooms"] > cfg["rooms_max"]:
             return False
 
     # קומה
-    if floor is not None:
-        if floor < cfg["min_floor"]:
+    if details["floor"] is not None:
+        if details["floor"] < cfg["min_floor"]:
+            return False
+
+    # שכונה/אזור:
+    # אם לא מצליחים למצוא — לא נפסול (כדי לא לפספס).
+    # אבל אם כן יש טקסט, נבדוק מילות שכונה.
+    text = details.get("neighborhood_text") or ""
+    keys = area_cfg.get("neighborhood_keywords") or []
+    if keys:
+        if text and not any(k in text for k in keys):
+            # אם יש לנו טקסט ולא מצאנו שכונה – נחשב "לא מתאים"
             return False
 
     return True
 
 
-def score_item(item, cfg):
-    # ניקוד קל כדי להעדיף "עורפי/שקט/פנימי" אם מופיע
-    t = item["text"]
-    score = 0
-    for kw in cfg.get("quiet_keywords", []):
-        if kw in t:
-            score += 1
-    # תעדוף מודעות שיש בהן מחיר (כדי שהן אמיתיות/ברורות יותר)
-    if extract_number(t) is not None:
-        score += 1
-    return score
-
-
 def main():
     token = os.environ.get("BOT_TOKEN")
     chat_id = os.environ.get("CHAT_ID")
+    debug = os.environ.get("DEBUG", "1") == "1"
 
     if not token or not chat_id:
         raise RuntimeError("Missing BOT_TOKEN or CHAT_ID env vars (set them in GitHub Secrets).")
@@ -183,34 +180,58 @@ def main():
     cfg = load_config()
     seen = load_seen()
 
-    html = fetch_html(SEARCH_URL)
-    listings = parse_listings(html)
+    search_html = fetch_html(SEARCH_URL)
+    links = collect_listing_links(search_html)
 
-    new_hits_by_area = []
+    # נבדוק הרבה לינקים כדי להימנע מפספוסים
+    links = links[:80]
+
+    total_links = len(links)
+    new_links = [x for x in links if x["id"] not in seen]
+
+    debug_lines = []
+    debug_lines.append(f"Debug: נמצאו {total_links} מודעות בעמוד, מתוכן {len(new_links)} חדשות (לא נראו).")
+
+    results_by_area = []
+
     for area in cfg["areas"]:
         hits = []
-        for it in listings:
-            if it["id"] in seen:
+        checked = 0
+
+        for it in new_links:
+            checked += 1
+            try:
+                item_html = fetch_html(it["link"])
+                details = parse_details_from_item_page(item_html)
+            except Exception:
+                # אם מודעה נחסמת/נכשלת – פשוט נמשיך
                 continue
-            if matches_filters(it, cfg, area):
+
+            if passes_filters(details, cfg, area):
                 hits.append(it)
 
-        hits.sort(key=lambda x: score_item(x, cfg), reverse=True)
-        if hits:
-            new_hits_by_area.append((area["title"], hits[:10]))  # עד 10 לכל אזור
+            # לא להעמיס: מקס 35 בדיקות לכל אזור
+            if checked >= 35:
+                break
 
-    if not new_hits_by_area:
-        # שימי לב: זה “אין חדש מאז ריצה קודמת”, לא “אין דירות באתר”
-        tg_send(token, chat_id, "אין מודעות חדשות שעברו את הסינון בריצה הזו 🙂")
+            time.sleep(0.5)
+
+        if hits:
+            results_by_area.append((area["title"], hits[:10]))
+
+    if debug:
+        tg_send(token, chat_id, "\n".join(debug_lines))
+        time.sleep(1)
+
+    if not results_by_area:
+        tg_send(token, chat_id, "לא נמצאו דירות שעברו סינון בריצה הזו. אם זה לא הגיוני – נרחיב עוד יותר את הקריטריונים/נשנה מקור נתונים.")
         return
 
-    # שליחה מסודרת: כותרת אזור + קישורים
-    for title, hits in new_hits_by_area:
+    for title, hits in results_by_area:
         lines = [title]
         for it in hits:
-            lines.append(f"- {it['link']}")
+            lines.append(it["link"])
             seen.add(it["id"])
-
         tg_send(token, chat_id, "\n".join(lines))
         time.sleep(1)
 
