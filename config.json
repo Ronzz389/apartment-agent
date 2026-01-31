@@ -1,8 +1,5 @@
 {
-  "sources": [
-    {
-      "name": "תל אביב – (צפון ישן / לב העיר / רמת אביב)",
-      "url": "https://www.yad2.co.il/realestate/rent?minPrice=5500&maxPrice=7300&minRooms=1.5&maxRooms=3&minFloor=1&imageOnly=1&priceOnly=1&multiNeighborhood=1520%2C1483%2C197&zoom=12"
-    }
-  ]
+  "search_url": "https://www.yad2.co.il/realestate/rent?minPrice=5500&maxPrice=7300&minRooms=1.5&maxRooms=3&minFloor=1&imageOnly=1&priceOnly=1&multiNeighborhood=1520%2C1483%2C197&zoom=12&",
+  "scroll_rounds": 8,
+  "max_links_to_send": 20
 }
